@@ -23,12 +23,25 @@ yc compute instance create \
 добавить свой ssh ключ в metadata ВМ
 
 зайти удаленным ssh (первая сессия), не забывайте про ssh-add
+```shell
+yc compute instance list
+ssh ubuntu@otus_vm_ubuntu
+```
 
 поставить PostgreSQL
+```shell
+sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' && \
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add - && \
+sudo apt-get update && \
+sudo apt-get -y install postgresql-15
+```
 
 зайти вторым ssh (вторая сессия)
 
 запустить везде psql из под пользователя postgres
+```shell
+sudo su - postgres
+```
 
 выключить auto commit
 
