@@ -1,0 +1,44 @@
+version: '3'
+
+services:
+  postgres:
+    image: postgres:15
+    env_file: .env
+    volumes:
+      - ./tmp/postgres/data:/var/lib/postgresql/data
+    networks:
+      - otus
+    ports:
+      - "5432:5432"
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile-client
+    env_file: .env
+    environment:
+      PGDATABASE: ${POSTGRES_DB}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+    depends_on:
+      - postgres
+    profiles:
+      - donotstart
+    networks:
+      - otus
+
+  adminer:
+    image: adminer:latest
+    restart: always
+    depends_on:
+      - postgres
+    networks:
+      - otus
+    ports:
+      - "8080:8080"
+
+networks:
+  otus:
+    external: false
