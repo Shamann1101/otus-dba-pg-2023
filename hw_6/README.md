@@ -138,3 +138,57 @@ select * from persons;
 данными из /var/lib/postgres, перемонтируйте внешний диск который сделали ранее от первой виртуальной машины ко второй и
 запустите PostgreSQL на второй машине так чтобы он работал с данными на внешнем диске, расскажите как вы это сделали и
 что в итоге получилось.
+
+> Для монтирования директорий воспользовался NFS
+> https://www.digitalocean.com/community/tutorials/how-to-set-up-an-nfs-mount-on-ubuntu-22-04
+
+
+```shell
+# На хост машине
+echo '/mnt/vdb1/postgresql/15 vm-ubuntu-second(rw,sync,no_root_squash,no_subtree_check)' >> /etc/exports
+```
+
+```shell
+# На клиент машине
+echo 'vm-ubuntu:/mnt/vdb1/postgresql/15 /nfs/postgresql/15 nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0' >> /etc/fstab
+vim /etc/postgresql/15/main/postgresql.conf
+# Указываем целевую директорию
+# data_directory = '/nfs/postgresql/15/main'
+sudo -u postgres psql iso
+```
+
+```postgresql
+-- На клиент машине
+select * from persons;
+```
+| id | first_name | second_name |
+|----|------------|-------------|
+| 1  | ivan       | ivanov      |
+| 2  | petr       | petrov      |
+| 3  | sergey     | sergeev     |
+| 4  | sveta      | svetova     |
+
+```postgresql
+-- На клиент машине
+insert into persons (first_name, second_name) values ('anton', 'antonov');
+select * from persons;
+```
+| id | first_name | second_name |
+|----|------------|-------------|
+| 1  | ivan       | ivanov      |
+| 2  | petr       | petrov      |
+| 3  | sergey     | sergeev     |
+| 4  | sveta      | svetova     |
+| 5  | anton      | antonov     |
+
+```postgresql
+-- На хост машине
+select * from persons;
+```
+| id | first_name | second_name |
+|----|------------|-------------|
+| 1  | ivan       | ivanov      |
+| 2  | petr       | petrov      |
+| 3  | sergey     | sergeev     |
+| 4  | sveta      | svetova     |
+| 5  | anton      | antonov     |
