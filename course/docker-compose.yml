@@ -1,0 +1,26 @@
+version: '3'
+
+services:
+  postgres:
+    image: postgres:15
+    env_file: .env
+    volumes:
+      - ./tmp/postgres/data:/var/lib/postgresql/data
+    networks:
+      - otus_course
+    ports:
+      - "15432:5432"
+
+  adminer:
+    image: adminer:latest
+    restart: always
+    depends_on:
+      - postgres
+    networks:
+      - otus_course
+    ports:
+      - "8080:8080"
+
+networks:
+  otus_course:
+    external: false
