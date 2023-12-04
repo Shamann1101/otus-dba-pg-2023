@@ -38,6 +38,8 @@ limit 10;
 
 ### Тестирование на локальном стенде
 
+#### Гипотеза: CTE
+
 Вывод планировщика по исходному запросу
 
 ```text
@@ -316,3 +318,168 @@ Execution Time: 4378.474 ms
 ```
 
 По сравнению с исходным запросом получаем прирост в скорости в 19.34 раз.
+
+#### Гипотеза: columnar storage
+
+Для тестирования на локальном стенде было принято решение использовать готовый образ
+[citus](https://hub.docker.com/r/citusdata/citus).
+
+Развернув образ, добавляем необходимое нам расширение.
+
+```postgresql
+CREATE EXTENSION IF NOT EXISTS citus;
+\dx
+```
+
+| Name           | Version | Schema     | Description                  |
+|----------------|---------|------------|------------------------------|
+| citus          | 12.1-1  | pg_catalog | Citus distributed database   |
+| citus_columnar | 11.3-1  | pg_catalog | Citus Columnar extension     |
+| plpgsql        | 1.0     | pg_catalog | PL/pgSQL procedural language |
+
+По аналогии с гипотезой CTE выделяем редко используемые данные в материализованные представления.
+
+```postgresql
+create materialized view if not exists book.busstation_material as
+(
+select bs.id, bs.city || ', ' || bs.name as busstation
+from book.busstation bs);
+create unique index on book.busstation_material (id);
+
+create materialized view if not exists book.bus_capacity as
+(
+select b.id, count(s.id) as capacity
+from book.bus b
+         join book.seat s on b.id = s.fkbus
+group by b.id);
+create unique index on book.bus_capacity (id);
+```
+
+Известно, что таблицы с колоночным типом хранения более эффективны на больших наборах данных, поэтому выделяем самые
+объемные таблицы и создаем на их основе колоночные.
+
+```postgresql
+create table book.tickets_row (like book.tickets) using columnar;
+create table book.ride_row (like book.ride) using columnar;
+```
+
+Исследовав запросы в предыдущей гипотезе, выделяем запрос на подсчет купленных билетов во временную таблицу с колоночным
+хранением на основе созданных выше таблиц.
+
+```postgresql
+create temporary table bought_seats using columnar as
+select r.id, r.startdate, count(t.id) as bought_seats
+from book.ride_row r
+         left join book.tickets_row t on r.id = t.fkride
+group by r.id, r.startdate;
+```
+
+Получается достаточно тяжелый запрос, но эта временная таблица может пригодиться для других запросов, выходящих за рамки
+данного курсового проекта.
+
+```text
+HashAggregate  (cost=115888.65..117328.65 rows=144000 width=16) (actual time=5698.359..5738.275 rows=144000 loops=1)
+"  Output: r.id, r.startdate, count(t.id)"
+"  Group Key: r.id, r.startdate"
+  Batches: 1  Memory Usage: 18449kB
+  ->  Hash Right Join  (cost=1832.99..76997.37 rows=5185505 width=16) (actual time=91.895..3881.759 rows=5185505 loops=1)
+"        Output: r.id, r.startdate, t.id"
+        Hash Cond: (t.fkride = r.id)
+        ->  Custom Scan (ColumnarScan) on book.tickets_row t  (cost=0.00..3863.69 rows=5185505 width=12) (actual time=1.235..1286.039 rows=5185505 loops=1)
+"              Output: t.id, t.fkride"
+"              Columnar Projected Columns: id, fkride"
+        ->  Hash  (cost=32.99..32.99 rows=144000 width=8) (actual time=88.928..88.929 rows=144000 loops=1)
+"              Output: r.id, r.startdate"
+              Buckets: 262144  Batches: 1  Memory Usage: 7673kB
+              ->  Custom Scan (ColumnarScan) on book.ride_row r  (cost=0.00..32.99 rows=144000 width=8) (actual time=11.431..43.515 rows=144000 loops=1)
+"                    Output: r.id, r.startdate"
+"                    Columnar Projected Columns: id, startdate"
+Planning Time: 3.389 ms
+JIT:
+  Functions: 13
+"  Options: Inlining false, Optimization false, Expressions true, Deforming true"
+"  Timing: Generation 0.847 ms, Inlining 0.000 ms, Optimization 0.569 ms, Emission 8.771 ms, Total 10.188 ms"
+Execution Time: 5856.030 ms
+```
+
+Для сравнения с предыдущей гипотезой был установлен идентичный параметр _work_mem_.
+```postgresql
+set work_mem to '64MB';
+```
+
+Результирующий запрос похож на запрос из предыдущей гипотезы, но он выполняется ощутимо быстрее.
+
+```postgresql
+with busstation as
+         (select sch.id, bs.busstation
+          from book.schedule sch
+                   join book.busroute br
+                        on br.id = sch.fkroute
+                   join book.busstation_material bs
+                        on bs.id = br.fkbusstationfrom)
+select r.id, r.startdate, bst.busstation, bc.capacity total_seats, bs.bought_seats
+from ride r
+         left join busstation bst on r.fkschedule = bst.id
+         left join bought_seats bs on r.id = bs.id
+         left join book.bus_capacity bc on bc.id = r.fkbus
+order by r.startdate, r.id;
+```
+
+```text
+Sort  (cost=19526.47..19886.47 rows=144000 width=42) (actual time=335.936..355.387 rows=144000 loops=1)
+"  Output: r.id, r.startdate, bs_1.busstation, bc.capacity, bs.bought_seats"
+"  Sort Key: r.startdate, r.id"
+  Sort Method: quicksort  Memory: 18182kB
+  ->  Hash Left Join  (cost=4076.52..7188.76 rows=144000 width=42) (actual time=60.144..243.064 rows=144000 loops=1)
+"        Output: r.id, r.startdate, bs_1.busstation, bc.capacity, bs.bought_seats"
+        Inner Unique: true
+        Hash Cond: (r.fkbus = bc.id)
+        ->  Hash Left Join  (cost=4075.40..6489.25 rows=144000 width=38) (actual time=60.130..207.125 rows=144000 loops=1)
+"              Output: r.id, r.startdate, r.fkbus, bs_1.busstation, bs.bought_seats"
+              Hash Cond: (r.fkschedule = sch.id)
+              ->  Hash Right Join  (cost=4019.00..4452.84 rows=144000 width=24) (actual time=58.788..159.518 rows=144000 loops=1)
+"                    Output: r.id, r.startdate, r.fkschedule, r.fkbus, bs.bought_seats"
+                    Inner Unique: true
+                    Hash Cond: (bs.id = r.id)
+                    ->  Custom Scan (ColumnarScan) on pg_temp.bought_seats bs  (cost=0.00..55.83 rows=144000 width=12) (actual time=0.629..32.702 rows=144000 loops=1)
+"                          Output: bs.bought_seats, bs.id"
+"                          Columnar Projected Columns: id, bought_seats"
+                    ->  Hash  (cost=2219.00..2219.00 rows=144000 width=16) (actual time=58.064..58.066 rows=144000 loops=1)
+"                          Output: r.id, r.startdate, r.fkschedule, r.fkbus"
+                          Buckets: 262144  Batches: 1  Memory Usage: 8798kB
+                          ->  Seq Scan on book.ride r  (cost=0.00..2219.00 rows=144000 width=16) (actual time=0.007..23.790 rows=144000 loops=1)
+"                                Output: r.id, r.startdate, r.fkschedule, r.fkbus"
+              ->  Hash  (cost=38.40..38.40 rows=1440 width=22) (actual time=1.334..1.338 rows=1440 loops=1)
+"                    Output: sch.id, bs_1.busstation"
+                    Buckets: 2048  Batches: 1  Memory Usage: 93kB
+                    ->  Hash Join  (cost=3.58..38.40 rows=1440 width=22) (actual time=0.038..1.045 rows=1440 loops=1)
+"                          Output: sch.id, bs_1.busstation"
+                          Inner Unique: true
+                          Hash Cond: (br.fkbusstationfrom = bs_1.id)
+                          ->  Hash Join  (cost=2.35..31.80 rows=1440 width=8) (actual time=0.025..0.696 rows=1440 loops=1)
+"                                Output: sch.id, br.fkbusstationfrom"
+                                Inner Unique: true
+                                Hash Cond: (sch.fkroute = br.id)
+                                ->  Seq Scan on book.schedule sch  (cost=0.00..25.40 rows=1440 width=8) (actual time=0.003..0.197 rows=1440 loops=1)
+"                                      Output: sch.id, sch.fkroute, sch.starttime, sch.price, sch.validfrom, sch.validto"
+                                ->  Hash  (cost=1.60..1.60 rows=60 width=8) (actual time=0.018..0.019 rows=60 loops=1)
+"                                      Output: br.id, br.fkbusstationfrom"
+                                      Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                      ->  Seq Scan on book.busroute br  (cost=0.00..1.60 rows=60 width=8) (actual time=0.004..0.010 rows=60 loops=1)
+"                                            Output: br.id, br.fkbusstationfrom"
+                          ->  Hash  (cost=1.10..1.10 rows=10 width=22) (actual time=0.011..0.011 rows=10 loops=1)
+"                                Output: bs_1.busstation, bs_1.id"
+                                Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                ->  Seq Scan on book.busstation_material bs_1  (cost=0.00..1.10 rows=10 width=22) (actual time=0.006..0.008 rows=10 loops=1)
+"                                      Output: bs_1.busstation, bs_1.id"
+        ->  Hash  (cost=1.05..1.05 rows=5 width=12) (actual time=0.009..0.009 rows=5 loops=1)
+"              Output: bc.capacity, bc.id"
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              ->  Seq Scan on book.bus_capacity bc  (cost=0.00..1.05 rows=5 width=12) (actual time=0.006..0.007 rows=5 loops=1)
+"                    Output: bc.capacity, bc.id"
+Planning Time: 0.711 ms
+Execution Time: 362.676 ms
+```
+
+По сравнению с исходным запросом получаем прирост в скорости в 13.62 раза, учитывая создания временной таблицы.
+Если брать "чистое" время выполнения запроса, то прирост в 233.5 раз.

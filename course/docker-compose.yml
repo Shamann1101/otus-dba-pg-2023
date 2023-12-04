@@ -11,6 +11,16 @@ services:
     ports:
       - "15432:5432"
 
+  citus:
+    image: citusdata/citus:postgres_15
+    env_file: .env
+    volumes:
+      - ./tmp/citus/data:/var/lib/postgresql/data
+    networks:
+      - otus_course
+    ports:
+      - "25432:5432"
+
   adminer:
     image: adminer:latest
     restart: always
