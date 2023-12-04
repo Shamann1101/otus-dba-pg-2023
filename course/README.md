@@ -181,10 +181,10 @@ Execution Time: 84683.808 ms
 
 Можно заметить, что в исходном запросе неверно считается кол-во мест в автобусе и проданных билетов.
 
-Для оптимизации запроса было принято решение вынести редко изменяемые данные в материализованные представления
+Для оптимизации запроса было принято решение вынести редко изменяемые данные в материализованные представления.
 
 ```postgresql
-create materialized view if not exists book.busstation_detail as
+create materialized view if not exists book.busstation_material as
 (
 select bs.id, bs.city || ', ' || bs.name as busstation
 from book.busstation bs);
