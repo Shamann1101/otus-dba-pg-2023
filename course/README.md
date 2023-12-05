@@ -34,7 +34,7 @@ limit 10;
 
 Схема БД:
 
-![DB Schema](book.png)
+![DB Schema](media/book.png)
 
 ### Тестирование на локальном стенде
 
@@ -203,6 +203,8 @@ group by b.id);
 create unique index on book.bus_capacity (id);
 ```
 
+![Materialized views](media/docker/cte/materialized_views.png)
+
 Сам запрос было решено оптимизировать при помощи CTE.
 
 ```postgresql
@@ -230,12 +232,16 @@ from book.ride r
 order by r.startdate, r.id;
 ```
 
+![CTE request](media/docker/cte/request.png)
+
 Также для оптимизации работы с памятью был увеличен параметр _work_mem_.
 ```postgresql
 set work_mem to '64MB';
 ```
 
 Вывод планировщика по оптимизированному запросу.
+
+![CTE request](media/docker/cte/request_explain.png)
 
 ```text
 Sort  (cost=182688.75..183048.75 rows=144000 width=42) (actual time=4350.298..4367.626 rows=144000 loops=1)
@@ -331,11 +337,18 @@ CREATE EXTENSION IF NOT EXISTS citus;
 \dx
 ```
 
+![Citus extensions](media/docker/citus/extensions.png)
+
 | Name           | Version | Schema     | Description                  |
 |----------------|---------|------------|------------------------------|
 | citus          | 12.1-1  | pg_catalog | Citus distributed database   |
 | citus_columnar | 11.3-1  | pg_catalog | Citus Columnar extension     |
 | plpgsql        | 1.0     | pg_catalog | PL/pgSQL procedural language |
+
+Для сравнения с предыдущей гипотезой был установлен идентичный параметр _work_mem_.
+```postgresql
+set work_mem to '64MB';
+```
 
 По аналогии с гипотезой CTE выделяем редко используемые данные в материализованные представления.
 
@@ -345,7 +358,9 @@ create materialized view if not exists book.busstation_material as
 select bs.id, bs.city || ', ' || bs.name as busstation
 from book.busstation bs);
 create unique index on book.busstation_material (id);
+```
 
+```postgresql
 create materialized view if not exists book.bus_capacity as
 (
 select b.id, count(s.id) as capacity
@@ -355,6 +370,8 @@ group by b.id);
 create unique index on book.bus_capacity (id);
 ```
 
+![Materialized views](media/docker/citus/materialized_views.png)
+
 Известно, что таблицы с колоночным типом хранения более эффективны на больших наборах данных, поэтому выделяем самые
 объемные таблицы и создаем на их основе колоночные.
 
@@ -362,6 +379,8 @@ create unique index on book.bus_capacity (id);
 create table book.tickets_row (like book.tickets) using columnar;
 create table book.ride_row (like book.ride) using columnar;
 ```
+
+![Relations](media/docker/citus/relations.png)
 
 Исследовав запросы в предыдущей гипотезе, выделяем запрос на подсчет купленных билетов во временную таблицу с колоночным
 хранением на основе созданных выше таблиц.
@@ -373,6 +392,8 @@ from book.ride_row r
          left join book.tickets_row t on r.id = t.fkride
 group by r.id, r.startdate;
 ```
+
+![Temporary table](media/docker/citus/temporary_table.png)
 
 Получается достаточно тяжелый запрос, но эта временная таблица может пригодиться для других запросов, выходящих за рамки
 данного курсового проекта.
@@ -402,11 +423,6 @@ JIT:
 Execution Time: 5856.030 ms
 ```
 
-Для сравнения с предыдущей гипотезой был установлен идентичный параметр _work_mem_.
-```postgresql
-set work_mem to '64MB';
-```
-
 Результирующий запрос похож на запрос из предыдущей гипотезы, но он выполняется ощутимо быстрее.
 
 ```postgresql
@@ -418,12 +434,18 @@ with busstation as
                    join book.busstation_material bs
                         on bs.id = br.fkbusstationfrom)
 select r.id, r.startdate, bst.busstation, bc.capacity total_seats, bs.bought_seats
-from ride r
+from book.ride r
          left join busstation bst on r.fkschedule = bst.id
          left join bought_seats bs on r.id = bs.id
          left join book.bus_capacity bc on bc.id = r.fkbus
 order by r.startdate, r.id;
 ```
+
+![Columnar request](media/docker/citus/request.png)
+
+Вывод планировщика по оптимизированному запросу.
+
+![Columnar request](media/docker/citus/request_explain.png)
 
 ```text
 Sort  (cost=19526.47..19886.47 rows=144000 width=42) (actual time=335.936..355.387 rows=144000 loops=1)
