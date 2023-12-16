@@ -1038,11 +1038,192 @@ order by r.startdate, r.id;
 (58 rows)
 ```
 
-Можно заметить, что самым "удачным" запросом получился второй, но в этом запросе самый "тяжелый" блок выполняется
-350676.764ms, постараемся разобраться, в чем проблема.
+Можно заметить, что самым "удачным" запросом получился первый, но в этом запросе самый "тяжелый" блок выполняется
+344976.740ms, постараемся разобраться, в чем проблема.
 
 ![CTE NEW RESOURCES](media/yc/cte/resource.png)
 
 Судя по мониторингу, можно сделать вывод, что в момент запроса мы достигли лимита пропускной способности диска.
 
-Итоговый запрос оказался быстрее изначального в 4.29 раз.
+Итоговый запрос оказался быстрее изначального в 4.44 раз.
+
+### Гипотеза: columnar storage
+
+Для использования citus на существующей виртуальной машине, устанавливаем расширения согласно
+[документации](https://github.com/citusdata/citus?tab=readme-ov-file#install-citus-locally).
+
+![Extensions](media/yc/citus/extensions.png)
+
+Используя опыт, полученный при исследовании гипотезы на локальной машине, создаем таблицу _tickets_row_ с колоночным
+типом хранения.
+
+```postgresql
+create table book.tickets_row (like book.tickets) using columnar;
+```
+
+По аналогии создаем временную таблицу купленных билетов _bought_seats_.
+
+```postgresql
+explain (analyse, buffers, verbose)
+create temporary table bought_seats using columnar as
+select t.fkride, count(t.id) as bought_seats
+from book.tickets t
+group by t.fkride;
+```
+
+```sql
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate  (cost=1284518.49..1299629.02 rows=1511053 width=12) (actual time=397655.488..398063.176 rows=1500000 loops=1)
+   Output: fkride, count(id)
+   Group Key: t.fkride
+   Batches: 1  Memory Usage: 172049kB
+   Buffers: shared hit=288 read=613315
+   ->  Gather  (cost=952086.83..1269407.96 rows=3022106 width=12) (actual time=394364.903..395344.049 rows=4500000 loops=1)
+         Output: fkride, (PARTIAL count(id))
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=288 read=613315
+         ->  Partial HashAggregate  (cost=951086.83..966197.36 rows=1511053 width=12) (actual time=394271.465..394821.739 rows=1500000 loops=3)
+               Output: fkride, PARTIAL count(id)
+               Group Key: t.fkride
+               Batches: 1  Memory Usage: 221201kB
+               Buffers: shared hit=288 read=613315
+               Worker 0:  actual time=394204.001..394790.968 rows=1500000 loops=1
+                 Batches: 1  Memory Usage: 172049kB
+                 JIT:
+                   Functions: 7
+                   Options: Inlining true, Optimization true, Expressions true, Deforming true
+                   Timing: Generation 0.819 ms, Inlining 145.564 ms, Optimization 33.589 ms, Emission 22.149 ms, Total 202.121 ms
+                 Buffers: shared hit=9 read=204963
+               Worker 1:  actual time=394245.726..394852.700 rows=1500000 loops=1
+                 Batches: 1  Memory Usage: 172049kB
+                 JIT:
+                   Functions: 7
+                   Options: Inlining true, Optimization true, Expressions true, Deforming true
+                   Timing: Generation 0.840 ms, Inlining 101.137 ms, Optimization 38.300 ms, Emission 23.798 ms, Total 164.075 ms
+                 Buffers: shared hit=19 read=203074
+               ->  Parallel Seq Scan on book.tickets t  (cost=0.00..838592.22 rows=22498922 width=12) (actual time=5.736..386290.471 rows=17999158 loops=3)
+                     Output: id, fkride, fio, contact, fkseat
+                     Buffers: shared hit=288 read=613315
+                     Worker 0:  actual time=7.599..386401.151 rows=18037626 loops=1
+                       Buffers: shared hit=9 read=204963
+                     Worker 1:  actual time=9.603..386487.790 rows=17872344 loops=1
+                       Buffers: shared hit=19 read=203074
+ Planning Time: 0.110 ms
+ JIT:
+   Functions: 26
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 2.416 ms, Inlining 253.539 ms, Optimization 141.237 ms, Emission 109.124 ms, Total 506.316 ms
+ Execution Time: 398588.121 ms
+(42 rows)
+```
+
+Ожидаемо упираемся в лимиты квоты диска.
+
+![Resources](media/yc/citus/resource.png)
+
+Исследуем оптимизированный запрос.
+
+![CTE](media/yc/citus/cte.png)
+
+```postgresql
+explain (analyse, buffers, verbose)
+with busstation as
+         (select sch.id, bs.busstation
+          from book.schedule sch
+                   join book.busroute br
+                        on br.id = sch.fkroute
+                   join book.busstation_material bs
+                        on bs.id = br.fkbusstationfrom)
+select r.id, r.startdate, bst.busstation, bc.capacity total_seats, bs.bought_seats
+from book.ride r
+         left join busstation bst on r.fkschedule = bst.id
+         left join bought_seats bs on r.id = bs.fkride
+         left join book.bus_capacity bc on bc.id = r.fkbus
+order by r.startdate, r.id
+```
+
+```sql
+                                                                          QUERY PLAN                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=272545.62..276681.21 rows=1654236 width=42) (actual time=6510.589..6762.840 rows=1500000 loops=1)
+   Output: r.id, r.startdate, bs_1.busstation, bc.capacity, bs.bought_seats
+   Sort Key: r.startdate, r.id
+   Sort Method: quicksort  Memory: 174543kB
+   Buffers: shared hit=6 read=8124, local read=8109 dirtied=8109 written=8109
+   ->  Hash Left Join  (cost=41919.26..101681.79 rows=1654236 width=42) (actual time=3659.908..5414.445 rows=1500000 loops=1)
+         Output: r.id, r.startdate, bs_1.busstation, bc.capacity, bs.bought_seats
+         Inner Unique: true
+         Hash Cond: (r.fkbus = bc.id)
+         Buffers: shared read=8124, local read=8109 dirtied=8109 written=8109
+         ->  Hash Left Join  (cost=41918.15..93657.63 rows=1654236 width=38) (actual time=3658.500..5105.815 rows=1500000 loops=1)
+               Output: r.id, r.startdate, r.fkbus, bs_1.busstation, bs.bought_seats
+               Hash Cond: (r.fkschedule = sch.id)
+               Buffers: shared read=8123, local read=8109 dirtied=8109 written=8109
+               ->  Hash Right Join  (cost=41859.00..70852.74 rows=1654236 width=24) (actual time=3628.907..4735.932 rows=1500000 loops=1)
+                     Output: r.id, r.startdate, r.fkschedule, r.fkbus, bs.bought_seats
+                     Inner Unique: true
+                     Hash Cond: (bs.fkride = r.id)
+                     Buffers: shared read=8109, local read=8109 dirtied=8109 written=8109
+                     ->  Seq Scan on pg_temp.bought_seats bs  (cost=0.00..24651.36 rows=1654236 width=12) (actual time=0.054..231.923 rows=1500000 loops=1)
+                           Output: bs.fkride, bs.bought_seats
+                           Buffers: local read=8109 dirtied=8109 written=8109
+                     ->  Hash  (cost=23109.00..23109.00 rows=1500000 width=16) (actual time=3626.037..3626.040 rows=1500000 loops=1)
+                           Output: r.id, r.startdate, r.fkschedule, r.fkbus
+                           Buckets: 2097152  Batches: 1  Memory Usage: 86697kB
+                           Buffers: shared read=8109
+                           ->  Seq Scan on book.ride r  (cost=0.00..23109.00 rows=1500000 width=16) (actual time=30.152..3184.515 rows=1500000 loops=1)
+                                 Output: r.id, r.startdate, r.fkschedule, r.fkbus
+                                 Buffers: shared read=8109
+               ->  Hash  (cost=40.40..40.40 rows=1500 width=22) (actual time=29.532..29.536 rows=1500 loops=1)
+                     Output: sch.id, bs_1.busstation
+                     Buckets: 2048  Batches: 1  Memory Usage: 96kB
+                     Buffers: shared read=14
+                     ->  Hash Join  (cost=3.58..40.40 rows=1500 width=22) (actual time=23.988..29.273 rows=1500 loops=1)
+                           Output: sch.id, bs_1.busstation
+                           Inner Unique: true
+                           Hash Cond: (br.fkbusstationfrom = bs_1.id)
+                           Buffers: shared read=14
+                           ->  Hash Join  (cost=2.35..33.57 rows=1500 width=8) (actual time=21.999..27.013 rows=1500 loops=1)
+                                 Output: sch.id, br.fkbusstationfrom
+                                 Inner Unique: true
+                                 Hash Cond: (sch.fkroute = br.id)
+                                 Buffers: shared read=13
+                                 ->  Seq Scan on book.schedule sch  (cost=0.00..27.00 rows=1500 width=8) (actual time=15.498..20.145 rows=1500 loops=1)
+                                       Output: sch.id, sch.fkroute, sch.starttime, sch.price, sch.validfrom, sch.validto
+                                       Buffers: shared read=12
+                                 ->  Hash  (cost=1.60..1.60 rows=60 width=8) (actual time=6.474..6.475 rows=60 loops=1)
+                                       Output: br.id, br.fkbusstationfrom
+                                       Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                       Buffers: shared read=1
+                                       ->  Seq Scan on book.busroute br  (cost=0.00..1.60 rows=60 width=8) (actual time=6.442..6.450 rows=60 loops=1)
+                                             Output: br.id, br.fkbusstationfrom
+                                             Buffers: shared read=1
+                           ->  Hash  (cost=1.10..1.10 rows=10 width=22) (actual time=1.973..1.974 rows=10 loops=1)
+                                 Output: bs_1.busstation, bs_1.id
+                                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                 Buffers: shared read=1
+                                 ->  Seq Scan on book.busstation_material bs_1  (cost=0.00..1.10 rows=10 width=22) (actual time=1.936..1.958 rows=10 loops=1)
+                                       Output: bs_1.busstation, bs_1.id
+                                       Buffers: shared read=1
+         ->  Hash  (cost=1.05..1.05 rows=5 width=12) (actual time=1.387..1.387 rows=5 loops=1)
+               Output: bc.capacity, bc.id
+               Buckets: 1024  Batches: 1  Memory Usage: 9kB
+               Buffers: shared read=1
+               ->  Seq Scan on book.bus_capacity bc  (cost=0.00..1.05 rows=5 width=12) (actual time=1.376..1.378 rows=5 loops=1)
+                     Output: bc.capacity, bc.id
+                     Buffers: shared read=1
+ Planning:
+   Buffers: shared hit=190 read=16 dirtied=2
+ Planning Time: 21.830 ms
+ JIT:
+   Functions: 44
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 2.787 ms, Inlining 0.000 ms, Optimization 0.894 ms, Emission 27.498 ms, Total 31.179 ms
+ Execution Time: 6830.818 ms
+(75 rows)
+```
+
+По сравнению с исходным запросом получаем прирост в скорости в 3.77 раз, учитывая создания временной таблицы.
+Если брать "чистое" время выполнения запроса, то прирост в 244.04 раз.
